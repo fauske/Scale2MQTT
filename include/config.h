@@ -10,6 +10,16 @@
 #define USER_AGE 43        // år
 #define USER_HEIGHT_CM 183 // cm
 
+// Innebygd LED gir tilbakemelding etter en veiing: 1 blink = måling lagret, 2 = ingen måling/BLE-feil, 3 = sending via Wi-Fi/MQTT feilet.
+#define LED_PIN 8          // ESP32-C3 Super Mini
+#define LED_ACTIVE_LOW true
+
+// Ekstra feilsøkingslogg (BLE-forsøk, RSSI osv.)
+#define VERBOSE true
+
+// Skriver ut hver annonsering fra vekta og kobler ikke til. Brukes til å se når vekta blir tilkoblingsvillig.
+#define ADV_DEBUG false
+
 // MQTT
 #define MQTT_CLIENT_ID "scale2mqtt"
 #define MQTT_TOPIC "scale2mqtt/senssun/state"

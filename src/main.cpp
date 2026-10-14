@@ -9,10 +9,12 @@
 #include "secrets.h"
 
 static const uint32_t CONNECT_WINDOW_MS = 30000;
+static const uint32_t GIVE_UP_PAUSE_MS = 3000; // vekta annonserer selv om ingen står på den
 static const uint32_t SESSION_TIMEOUT_MS = 120000;
 static const uint32_t COOLDOWN_AFTER_PUBLISH_MS = 30000;
-static const uint32_t WIFI_TIMEOUT_MS = 12000;
+static const uint32_t WIFI_TIMEOUT_MS = 20000;
 static const uint32_t RETRY_PUBLISH_MS = 300000;
+static const uint32_t PUBLISH_DELAY_MS = 120000; // Wi-Fi forstyrrer BLE, så vi sender først en stund etter veiingen
 static const uint32_t PARTIAL_GRACE_MS = 20000; // vent så lenge på fett/muskel etter stabil vekt
 
 struct Measurement {
@@ -29,11 +31,27 @@ static volatile bool measurementReady = false;
 static volatile bool sendUserCmd = false;
 static bool userCmdSent = false;
 
+static void blink(int times, int onMs = 200) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, LED_ACTIVE_LOW ? LOW : HIGH);
+    delay(onMs);
+    digitalWrite(LED_PIN, LED_ACTIVE_LOW ? HIGH : LOW);
+    delay(200);
+  }
+}
+
 class ScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
   void onResult(NimBLEAdvertisedDevice *dev) override {
+    if (dev->getAddress() == targetAddr && ADV_DEBUG) {
+      char hex[100] = {0};
+      size_t n = min(dev->getPayloadLength(), (size_t)32);
+      for (size_t i = 0; i < n; i++) sprintf(hex + i * 3, "%02x ", dev->getPayload()[i]);
+      Serial.printf("[%lu] ADV rssi=%d type=%d %s\n", millis(), dev->getRSSI(), dev->getAdvType(), hex);
+      return;
+    }
     if (dev->getAddress() == targetAddr && !found) {
       foundAddr = dev->getAddress();
-      Serial.printf("Fant vekt, RSSI %d\n", dev->getRSSI());
+      if (VERBOSE) Serial.printf("Fant vekt, RSSI %d\n", dev->getRSSI());
       found = true;
       NimBLEDevice::getScan()->stop();
     }
@@ -51,8 +69,8 @@ static void onNotify(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t len,
         meas.weight = a / 10.0f;
         meas.hasWeight = true;
         weightAtMs = millis();
-        if (!userCmdSent) sendUserCmd = true;
-        Serial.printf("Stabil vekt: %.1f kg\n", meas.weight);
+        sendUserCmd = true;
+        if (VERBOSE) Serial.printf("Stabil vekt: %.1f kg\n", meas.weight);
       }
       break;
     case 0xB0:
@@ -121,7 +139,7 @@ static void writeDateTime(NimBLEClient *client) {
 static void writeUserCmd(NimBLEClient *client) {
   uint8_t msg[9] = {0xA5, 0x10, (uint8_t)((USER_MALE ? 15 * 16 : 0) + USER_ID), USER_AGE, USER_HEIGHT_CM, 0, 0, 0, 0};
   bool ok = writeSenssun(client, msg);
-  Serial.printf("Brukerkommando %s\n", ok ? "sendt" : "feilet");
+  if (!ok) Serial.println("Brukerkommando feilet");
   userCmdSent = true;
 }
 
@@ -178,7 +196,7 @@ static void loadPending() {
   prefs.end();
   for (int i = 0; i < n; i++)
     if (pending[i].ts == 0) pending[i].ms = 0xFFFFFFFF;
-  if (n > 0) Serial.printf("%d lagret måling(er) i kø\n", n);
+  if (n > 0 && VERBOSE) Serial.printf("%d lagret måling(er) i kø\n", n);
 }
 
 static void savePending() {
@@ -193,7 +211,7 @@ static void savePending() {
 static void enqueue(const Measurement &m) {
   // Vekta sender samme måling på nytt hvis vi kobler til igjen mens du fortsatt står på den.
   if (lastEnqueueMs && millis() - lastEnqueueMs < 120000 && fabsf(m.weight - lastEnqueueWeight) < 0.3f) {
-    Serial.println("Ignorerer duplikat");
+    if (VERBOSE) Serial.println("Ignorerer duplikat");
     return;
   }
   Stored s = {m.weight, m.fat, m.water, m.muscle, m.bone, m.kcal,
@@ -208,7 +226,7 @@ static void enqueue(const Measurement &m) {
   savePending();
   lastEnqueueMs = millis();
   lastEnqueueWeight = m.weight;
-  Serial.printf("Måling lagret (%d i kø)\n", pendingCount);
+  if (VERBOSE) Serial.printf("Måling lagret (%d i kø)\n", pendingCount);
 }
 
 static void formatPayload(const Stored &s, char *buf, size_t size) {
@@ -251,7 +269,7 @@ static void syncTime() {
     return;
   }
   nextTimeSync = millis() + 86400000UL;
-  Serial.println("Tid synkronisert");
+  if (VERBOSE) Serial.println("Tid synkronisert");
   time_t now = time(nullptr);
   for (int i = 0; i < pendingCount; i++)
     if (pending[i].ts == 0 && pending[i].ms != 0xFFFFFFFF) pending[i].ts = now - (millis() - pending[i].ms) / 1000;
@@ -261,19 +279,19 @@ static void syncTime() {
 static bool publishPending() {
   nextPublishTry = millis() + RETRY_PUBLISH_MS;
   if (pendingCount == 0 && !timeSyncDue()) return true;
-  Serial.printf("Wi-Fi-økt (%d måling(er) i kø) ...\n", pendingCount);
+  if (VERBOSE) Serial.printf("Wi-Fi-økt (%d måling(er) i kø) ...\n", pendingCount);
   WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); // C3 Super Mini har ofte dårlig antenne/strømforsyning ved full effekt
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t t = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t < WIFI_TIMEOUT_MS) delay(200);
 
   bool ok = WiFi.status() == WL_CONNECTED;
   if (!ok) {
-    Serial.println("Wi-Fi feilet, målingen blir liggende i køen");
+    Serial.printf("Wi-Fi feilet (status=%d), målingen blir liggende i køen\n", (int)WiFi.status());
   } else {
     syncTime();
     if (pendingCount == 0) {
-      WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
       return true;
     }
@@ -294,7 +312,7 @@ static bool publishPending() {
         }
         mqtt.loop();
         delay(100);
-        Serial.printf("MQTT publisert: %s\n", payload);
+        if (VERBOSE) Serial.printf("MQTT publisert: %s\n", payload);
         memmove(pending, pending + 1, (pendingCount - 1) * sizeof(Stored));
         pendingCount--;
       }
@@ -304,7 +322,6 @@ static bool publishPending() {
       Serial.printf("MQTT-tilkobling feilet, rc=%d\n", mqtt.state());
     }
   }
-  WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   return ok;
 }
@@ -312,7 +329,7 @@ static bool publishPending() {
 static void runSession() {
   NimBLEClient *client = NimBLEDevice::createClient();
   client->setConnectTimeout(10);
-  // Kort intervall gjør at mislykkede forsøk gir opp etter ~45 ms i stedet for ~300 ms.
+  // Kort intervall gjør at mislykkede forsøk gir opp raskt i stedet for etter ~500 ms.
   client->setConnectionParams(6, 6, 0, 400);
 
   // Vekta annonserer sjelden og avviser mange tilkoblinger, så vi prøver kontinuerlig en stund.
@@ -324,13 +341,14 @@ static void runSession() {
     uint32_t t0 = millis();
     ok = client->connect(foundAddr, false);
     if (!ok) {
-      Serial.printf("Forsøk %d feilet (kode %d, %lu ms)\n", attempt, client->getLastError(), millis() - t0);
+      if (VERBOSE && client->getLastError() != 574) Serial.printf("Forsøk %d feilet (kode %d, %lu ms)\n", attempt, client->getLastError(), millis() - t0);
       delay(10);
     }
   }
-  Serial.printf("%s etter %d forsøk, %lu ms\n", ok ? "Tilkoblet" : "Ga opp", attempt, millis() - tryStart);
+  if (VERBOSE || !ok) Serial.printf("%s etter %d forsøk, %lu ms\n", ok ? "Tilkoblet" : "Ga opp", attempt, millis() - tryStart);
   if (!ok) {
     NimBLEDevice::deleteClient(client);
+    delay(GIVE_UP_PAUSE_MS);
     return;
   }
 
@@ -345,10 +363,13 @@ static void runSession() {
     Serial.println("Fant ikke eller kunne ikke abonnere på FFF1");
     client->disconnect();
     NimBLEDevice::deleteClient(client);
+    blink(2);
     return;
   }
-  Serial.println("Abonnerer. Stå på vekta ...");
+  if (VERBOSE) Serial.println("Abonnerer. Stå på vekta ...");
+  blink(1, 100);
   writeDateTime(client);
+  writeUserCmd(client);
 
   uint32_t start = millis();
   while (client->isConnected() && !measurementReady && millis() - start < SESSION_TIMEOUT_MS &&
@@ -371,17 +392,21 @@ static void runSession() {
 
   if (meas.hasWeight) {
     enqueue(meas);
-    publishPending();
+    nextPublishTry = millis() + PUBLISH_DELAY_MS;
+    blink(1, 600);
     delay(COOLDOWN_AFTER_PUBLISH_MS);
   } else {
     Serial.println("Ingen måling");
+    blink(2);
   }
 }
 
 void setup() {
   Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LED_ACTIVE_LOW ? HIGH : LOW);
   delay(2000);
-  Serial.println("Scale2MQTT starter");
+  if (VERBOSE) Serial.println("Scale2MQTT starter");
   loadPending();
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
@@ -390,12 +415,16 @@ void setup() {
   scan->setActiveScan(true);
   scan->setInterval(100);
   scan->setWindow(99);
+  if (ADV_DEBUG) scan->setDuplicateFilter(false);
 }
 
 void loop() {
+  if ((pendingCount > 0 || timeSyncDue()) && (int32_t)(millis() - nextPublishTry) >= 0) {
+    if (!publishPending() && pendingCount > 0) blink(3, 600);
+    return;
+  }
   found = false;
   NimBLEDevice::getScan()->start(10, false);
   NimBLEDevice::getScan()->clearResults();
   if (found) runSession();
-  else if ((pendingCount > 0 || timeSyncDue()) && millis() >= nextPublishTry) publishPending();
 }
