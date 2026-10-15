@@ -1,105 +1,149 @@
 # Scale2MQTT
 
-Firmware for ESP32-C3 (testet på «Super Mini») som leser målinger fra en Senssun Fat-baserte Bluetooth-vekt og sender dem til MQTT, med automatisk oppsett i Home Assistant.
+Firmware for ESP32-C3 som leser en Senssun-kompatibel kroppsanalysevekt over Bluetooth LE og sender målingene til MQTT. Home Assistant kan oppdage sensorene automatisk via MQTT Discovery.
 
-Utviklet og testet med en MarQuant-vekt fra Jula som annonserer seg som `SENSSUN FAT`. Andre vekter med samme protokoll (tjeneste `0xFFF0`) kan fungere, men er ikke testet.
+Testet med en ESP32-C3 Super Mini og en MarQuant-vekt fra Jula som annonserer seg som `SENSSUN FAT`. Andre vekter med samme BLE-protokoll kan fungere, men er ikke verifisert.
 
-## Hva den gjør
+## Hardware og krav
 
-1. Skanner kontinuerlig etter vekta (Bluetooth LE) og kobler til når den våkner.
-2. Stiller klokka på vekta og sender brukerprofilen (kjønn, alder, høyde), slik at vekta beregner kroppssammensetning.
-3. Leser vekt, fett, vann, muskler, bein og kalorier.
-4. Lagrer målingen i flash (NVS), så den overlever strømbrudd.
-5. Slår på Wi-Fi, synkroniserer klokka (NTP) og publiserer målingene til MQTT med tidsstempel.
-6. Slår av Wi-Fi igjen, siden Wi-Fi og Bluetooth deler radio.
+- ESP32-C3 Super Mini. PlatformIO-målet i prosjektet er `esp32-c3-devkitm-1`.
+- MarQuant kroppsanalysevekt fra Jula, Senssun-basert modell som annonserer `SENSSUN FAT`.
+- Stabil 5 V USB-strømforsyning, for eksempel en vanlig USB-mobillader. Enheten skanner kontinuerlig og er ikke laget for batteridrift.
+- 2,4 GHz Wi-Fi-nettverk.
+- MQTT-broker som ESP32-en kan nå, for eksempel Mosquitto. Home Assistant må ha MQTT-integrasjonen satt opp mot brokeren.
+- VS Code med PlatformIO-utvidelsen, eller PlatformIO CLI.
 
-Er ikke Wi-Fi eller MQTT tilgjengelig, blir målingene liggende i køen (opptil 20) og sendes senere. Nytt forsøk skjer hvert femte minutt.
+## Funksjon
 
-### MQTT-melding
+1. Skanner etter den konfigurerte vekta og forsøker å koble til når den annonserer.
+2. Abonnerer på vektas BLE-varsler, stiller vektas klokke når ESP32-en har gyldig tid, og sender brukerprofilen.
+3. Leser stabil vekt, fett, vann, muskler, beinmasse og kalorier. Kroppsanalyse krever normalt bar hudkontakt med elektrodene.
+4. Lagrer målingen i ESP32-ens NVS-flash. Køen rommer opptil 20 målinger; når den er full, fjernes den eldste.
+5. Venter omtrent to minutter etter veiingen før Wi-Fi aktiveres. Dette reduserer radioforstyrrelser mens BLE brukes.
+6. Synkroniserer klokke ved behov og publiserer køen til MQTT. Wi-Fi slås av etter økten.
 
-Topic (standard): `scale2mqtt/senssun/state`, sendt med retain.
-
-```json
-{"weight_kg":85.0,"fat_pct":19.1,"water_pct":55.6,"muscle_pct":41.7,"bone_kg":3.8,"kcal":1889,"measured_at":"2026-10-10T08:12:49Z"}
-```
-
-Felt som vekta ikke rakk å sende, utelates. `measured_at` er UTC og mangler hvis klokka ikke var synkronisert og tidspunktet ikke kan regnes ut.
-
-### Home Assistant
-
-Med `HA_DISCOVERY` på publiseres MQTT Discovery-meldinger, og sensorene dukker opp av seg selv under enheten «Senssun vekt»: vekt, kroppsfett, vann, muskler, bein, kalorier og tidspunkt for måling.
-
-## Krav
-
-- ESP32-C3-kort (testet: Super Mini)
-- Senssun-kompatibel Bluetooth-vekt
-- MQTT-broker, for eksempel Mosquitto
-- [PlatformIO](https://platformio.org/) (VS Code-utvidelsen eller CLI)
-- Fast strømforsyning, for eksempel en USB-lader. Skanningen bruker ca. 50–80 mA, så batteridrift er ikke realistisk.
+Ved manglende Wi-Fi eller MQTT beholdes køen, og et nytt sende-forsøk gjøres senere. MQTT-meldingen publiseres med retain.
 
 ## Oppsett
 
-1. **Klon prosjektet og åpne det i VS Code med PlatformIO.**
+### 1. Opprett lokale nettverksinnstillinger
 
-2. **Finn vektens Bluetooth-adresse.** Bruk nRF Connect på mobilen og se etter enheten `SENSSUN FAT`.
+Kopier eksempelmalen:
 
-3. **Lag `include/secrets.h`** ved å kopiere `include/secrets.example.h`, og fyll inn:
-   ```c
-   #define WIFI_SSID "..."
-   #define WIFI_PASS "..."
-   #define MQTT_HOST "192.168.1.10"
-   #define MQTT_PORT 1883
-   #define MQTT_USER ""   // tom = uten innlogging
-   #define MQTT_PASS ""
-   ```
-   Filen ligger i `.gitignore` og sjekkes ikke inn.
+```sh
+cp include/secrets.example.h include/secrets.h
+```
 
-4. **Tilpass `include/config.h`:**
+Rediger `include/secrets.h` med verdiene for ditt miljø:
 
-   | Innstilling | Betydning |
-   |---|---|
-   | `SCALE_MAC` | Vektens adresse, små bokstaver |
-   | `USER_ID` | Bruker 1–12 på vekta |
-   | `USER_MALE` | `true` = mann, `false` = kvinne |
-   | `USER_AGE`, `USER_HEIGHT_CM` | Brukes til å beregne kroppssammensetning |
-   | `MQTT_TOPIC`, `MQTT_CLIENT_ID` | MQTT-oppsett |
-   | `HA_DISCOVERY`, `HA_DISCOVERY_PREFIX` | Home Assistant Discovery |
-   | `NTP_SERVER`, `TIMEZONE` | Tid og tidssone |
+| Innstilling | Beskrivelse |
+|---|---|
+| `WIFI_SSID` | SSID for 2,4 GHz-nettverket |
+| `WIFI_PASS` | Wi-Fi-passord |
+| `MQTT_HOST` | IP-adresse eller vertsnavn for MQTT-brokeren |
+| `MQTT_PORT` | MQTT-port, vanligvis `1883` for ukryptert lokal MQTT |
+| `MQTT_USER` | MQTT-brukernavn, eller tom streng hvis broker ikke bruker innlogging |
+| `MQTT_PASS` | MQTT-passord |
 
-5. **Bygg og last opp** (lukk serial monitor først, ellers er porten opptatt):
-   ```sh
-   pio run -t upload
-   pio device monitor
-   ```
+`include/secrets.h` er oppført i `.gitignore`; ikke legg passord i `config.h` eller commit secrets-fila.
 
-6. **Test.** Vekk vekta og gå på den barføtt, og stå helt stille til vekten stabiliserer seg. Monitor viser omtrent:
-   ```
-   Fant vekt, RSSI -45
-   Tilkoblet etter 12 forsøk, 3100 ms
-   Stabil vekt: 85.0 kg
-   Måling lagret (1 i kø)
-   MQTT publisert: {...}
-   ```
+### 2. Tilpass vekt og Home Assistant
 
-## Vanlige problemer
+Rediger `include/config.h`:
 
-- **Koble til tar lang tid eller feiler med kode 574.** Vekta avviser mange tilkoblingsforsøk. Firmwaren prøver kontinuerlig i 30 sekunder, men plasser ESP-en nær vekta (innen en meter) og vekk vekta først. Svak antenne på billige kort kan forverre dette.
-- **Bare vekt, ingen fett eller vann.** Gå på barføtt og stå stille til målingen er ferdig. Sjekk at `USER_AGE` og `USER_HEIGHT_CM` er riktige.
-- **Vekta tar ikke imot tilkobling.** Slå av Bluetooth på mobilen eller lukk andre apper som er koblet til vekta. Vekta tar vanligvis imot én tilkobling av gangen.
-- **Opplasting feiler med «port busy».** Lukk serial monitor.
-- **Sensorer dukker ikke opp i Home Assistant.** Sjekk at MQTT-integrasjonen bruker samme prefiks som `HA_DISCOVERY_PREFIX`, og at en måling er fullført minst én gang.
+| Innstilling | Hva brukeren setter |
+|---|---|
+| `SCALE_MAC` | BLE-adressen til vekta. Finn den med nRF Connect mens vekta annonserer. |
+| `USER_ID` | Brukerprofilnummeret på vekta, 1–12. |
+| `USER_MALE` | `true` eller `false`, etter profilen som er valgt i appen/vekta. |
+| `USER_AGE` | Alder i år. |
+| `USER_HEIGHT_CM` | Høyde i centimeter. |
+| `MQTT_CLIENT_ID` | MQTT-klient-ID. Bruk en unik verdi hvis du har flere Scale2MQTT-enheter. |
+| `MQTT_TOPIC` | Topic for målingsmeldingen. Bruk en egen topic per enhet ved flere vekter. |
+| `HA_DISCOVERY` | `true` for automatisk opprettelse av Home Assistant-sensorer. |
+| `HA_DISCOVERY_PREFIX` | Discovery-prefiks. Må samsvare med Home Assistant, vanligvis `homeassistant`. |
+| `DEVICE_ID`, `DEVICE_NAME` | Stabil, unik enhetsidentifikator og navn som vises i Home Assistant. |
+| `NTP_SERVER`, `TIMEZONE` | NTP-server og tidssone. Standard tidssone er satt for Norge. |
+| `LED_PIN`, `LED_ACTIVE_LOW` | Endres bare hvis kortvarianten har status-LED på en annen GPIO eller med motsatt polaritet. |
+| `VERBOSE`, `ADV_DEBUG` | Seriell feilsøking. `ADV_DEBUG` skriver annonseringsdata og kobler ikke til vekta. |
 
-## Begrensninger
+### 3. Bygg, last opp og åpne Serial Monitor
 
-- Støtter én vekt og én bruker.
-- Home Assistant lagrer historikk på tidspunktet meldingen mottas. Forsinkede målinger får riktig tidspunkt bare i sensoren «Målt».
-- Protokollet er reverse-engineeret av andre og ikke offisielt dokumentert, så andre modeller kan oppføre seg annerledes.
+Lukk Serial Monitor før opplasting, slik at serieporten ikke er opptatt.
 
-## Protokoll (kort)
+```sh
+pio run
+pio run -t upload
+pio device monitor
+```
 
-Tjeneste `0xFFF0`. Skriv til `0xFFF2`, abonner på notifications fra `0xFFF1`.
+Serial Monitor bruker `115200` baud. I VS Code kan de tilsvarende Build, Upload og Monitor-oppgavene kjøres fra PlatformIO.
 
-- Notification: `FF A5 d1 d2 d3 d4 type`, verdier er 16-bit big-endian i 0,1-enheter. `type`: `A0` levende vekt, `AA` stabil vekt, `B0` fett og vann, `C0` muskler og bein (bein-bytene er byttet), `D0` kalorier, `BE` feil.
-- Kommandoer (9 byte, sjekksum = sum av byte 1–6 i byte 7): `A5 30` dato, `A5 31` tid, `A5 10` bruker (kjønn+id, alder, høyde).
+### 4. Ta en måling
 
-Protokollet er beskrevet i [openScale issue #309](https://github.com/oliexdev/openScale/issues/309) og i openScales Senssun-støtte.
+Lukk Senssun-appen og andre apper som kan holde BLE-forbindelsen til vekta. Vekk vekta, vent til Serial Monitor viser `Abonnerer. Stå på vekta ...`, og gå deretter barføtt opp på den. Stå stille mens målingen stabiliseres. MQTT-sendingen kan komme omtrent to minutter etter målingen.
+
+Typisk logg ved vellykket måling:
+
+```text
+Fant vekt, RSSI -50
+Tilkoblet etter ...
+Abonnerer. Stå på vekta ...
+Stabil vekt: 85.1 kg
+Måling lagret (1 i kø)
+MQTT publisert: { ... }
+```
+
+## MQTT og Home Assistant
+
+Standard state-topic er `scale2mqtt/senssun/state`. Eksempel:
+
+```json
+{"weight_kg":85.1,"fat_pct":19.9,"water_pct":55.0,"muscle_pct":41.2,"bone_kg":3.8,"kcal":1890,"measured_at":"2026-10-15T08:36:30Z"}
+```
+
+Felt som ikke ble mottatt fra vekta, utelates. `measured_at` er UTC og utelates når måletidspunktet ikke er kjent. MQTT Discovery oppretter sensorene Vekt, Kroppsfett, Vann, Muskler, Bein, Kalorier og Målt under `DEVICE_NAME`.
+
+Home Assistant registrerer historikk når den mottar meldingen. `measured_at` viser når målingen ble tatt, men tilbakedaterer ikke Home Assistant-historikken for målinger som har ligget i kø.
+
+## LED-status
+
+På standardoppsettet er den blå status-LED-en koblet til GPIO 8 og aktiv lav:
+
+- Ett kort blink: BLE-abonnementet er klart; det er nå du skal gå på vekta.
+- Ett langt blink: målingen er lagret.
+- To blink: ingen måling eller BLE-/abonnementsfeil.
+- Tre lange blink: sending feilet; køen beholdes for nytt forsøk.
+
+En rød LED på kortet kan være en fast strømindikator og er ikke nødvendigvis styrt av firmware.
+
+## Feilsøking
+
+- **Det tar lang tid før `Abonnerer` vises.** Skalaen kan avvise eller overse BLE-tilkoblingsforsøk. Firmwaren prøver i opptil 30 sekunder. Lukk Senssun-appen, plasser ESP32-en nær vekta og sjekk RSSI i loggen. Feilkode 13 betyr at forbindelsesforsøket fikk timeout.
+- **`Avsluttet (frakoblet)` rett etter abonnement.** Vekta koblet fra før måledata kom. Vekk vekta på nytt, lukk andre BLE-apper og prøv igjen.
+- **Bare vekt, ingen kroppsanalyse.** Gå barføtt slik at elektrodene får hudkontakt, og stå stille. Kontroller alder, høyde, kjønn og profilnummer.
+- **Målingen finnes ikke i Home Assistant.** Se etter `MQTT publisert` i Serial Monitor. Kontroller brokeradresse, innlogging, `MQTT_TOPIC`, MQTT-integrasjonen og at Discovery-prefikset stemmer.
+- **Opplasting feiler med «port busy».** Lukk Serial Monitor og prøv opplasting på nytt.
+- **`wifi:timeout when WiFi un-init` vises.** Dette er en melding fra ESP32 Wi-Fi-driveren under nedstenging. Kontroller om NTP/MQTT faktisk feilet; meldingen alene beviser ikke at sendingen mislyktes.
+
+## Begrensninger og release-status
+
+- Testet med én ESP32-C3 Super Mini og én MarQuant/SENSSUN FAT-vekt. Andre kort og vektmodeller er ikke verifisert.
+- Én vekt og én brukerprofil støttes per enhet.
+- BLE-protokollen er ikke offisielt dokumentert. Kroppsanalyseverdiene er vektas beregninger, ikke medisinske målinger.
+- Wi-Fi/MQTT bruker vanligvis ukryptert MQTT på det lokale nettverket. Ikke eksponer brokeren direkte mot internett.
+- Prosjektet har ingen automatisert testpakke. En vellykket PlatformIO-build verifiserer kompilering, ikke den fysiske BLE-/Wi-Fi-/Home Assistant-flyten.
+
+Før en bred release bør en ren oppstart og veiing testes med den tiltenkte ESP32-en og vekta, Home Assistant Discovery bekreftes, og kø/nytt forsøk testes når MQTT-broker eller Wi-Fi midlertidig er utilgjengelig.
+
+## BLE-protokollnotater
+
+Bekreftet GATT-oppsett for den testede vekta:
+
+- Tjeneste `FFF0`.
+- Notifications fra `FFF1`.
+- Skriv kommandoer til `FFF2`.
+- Varsler har formatet `FF A5 d1 d2 d3 d4 type checksum`. Verdiparene er 16-bit big-endian i 0,1-enheter. Typene er `A0` levende vekt, `AA` stabil vekt, `B0` fett og vann, `C0` muskler og bein, `D0` kalorier og `BE` målefeil. I `C0` er byte-rekkefølgen for beinverdien byttet.
+- Dato og tid sendes i 9-byte kommandoer (`A5 30` og `A5 31`). Brukerprofilen sendes i en 8-byte kommando (`A5 10`); tilleggbytes og checksum følger rammen som ble observert i Senssun-appens HCI-opptak.
+
+Protokollbakgrunn finnes i [openScale issue #309](https://github.com/oliexdev/openScale/issues/309) og openScales Senssun-støtte.

@@ -94,13 +94,13 @@ static void onNotify(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t len,
   if (meas.hasWeight && meas.hasFat && meas.hasMuscle && meas.hasKcal) measurementReady = true;
 }
 
-static bool writeSenssun(NimBLEClient *client, uint8_t *msg) {
+static bool writeSenssun(NimBLEClient *client, uint8_t *msg, size_t len) {
   uint8_t sum = 0;
   for (int i = 1; i < 7; i++) sum += msg[i];
   msg[7] = sum;
   NimBLERemoteService *svc = client->getService("FFF0");
   NimBLERemoteCharacteristic *chr = svc ? svc->getCharacteristic("FFF2") : nullptr;
-  return chr && chr->writeValue(msg, 9, true);
+  return chr && chr->writeValue(msg, len, true);
 }
 
 static bool timeValid() { return time(nullptr) > 1700000000; }
@@ -132,13 +132,13 @@ static void writeDateTime(NimBLEClient *client) {
 
   uint8_t dateMsg[9] = {0xA5, 0x30, (uint8_t)(year % 100), (uint8_t)(doy >> 8), (uint8_t)(doy & 0xFF), 0, 0, 0, 0};
   uint8_t timeMsg[9] = {0xA5, 0x31, (uint8_t)h, (uint8_t)m, (uint8_t)s, 0, 0, 0, 0};
-  writeSenssun(client, dateMsg);
-  writeSenssun(client, timeMsg);
+  writeSenssun(client, dateMsg, sizeof(dateMsg));
+  writeSenssun(client, timeMsg, sizeof(timeMsg));
 }
 
 static void writeUserCmd(NimBLEClient *client) {
-  uint8_t msg[9] = {0xA5, 0x10, (uint8_t)((USER_MALE ? 15 * 16 : 0) + USER_ID), USER_AGE, USER_HEIGHT_CM, 0, 0, 0, 0};
-  bool ok = writeSenssun(client, msg);
+  uint8_t msg[8] = {0xA5, 0x10, (uint8_t)((USER_MALE ? 0x80 : 0x00) | (USER_ID & 0x0F)), USER_AGE, USER_HEIGHT_CM, 0x02, 0xD0, 0};
+  bool ok = writeSenssun(client, msg, sizeof(msg));
   if (!ok) Serial.println("Brukerkommando feilet");
   userCmdSent = true;
 }
@@ -190,7 +190,7 @@ static void loadPending() {
   Preferences prefs;
   prefs.begin("scale", true);
   int n = prefs.getUChar("n", 0);
-  if (n > MAX_PENDING || prefs.getBytesLength("q") != n * sizeof(Stored)) n = 0;
+  if (n > MAX_PENDING || (n > 0 && (!prefs.isKey("q") || prefs.getBytesLength("q") != n * sizeof(Stored)))) n = 0;
   if (n > 0) prefs.getBytes("q", pending, n * sizeof(Stored));
   pendingCount = n;
   prefs.end();
@@ -328,9 +328,8 @@ static bool publishPending() {
 
 static void runSession() {
   NimBLEClient *client = NimBLEDevice::createClient();
-  client->setConnectTimeout(10);
-  // Kort intervall gjør at mislykkede forsøk gir opp raskt i stedet for etter ~500 ms.
-  client->setConnectionParams(6, 6, 0, 400);
+  client->setConnectTimeout(3);
+  client->setConnectionParams(8, 16, 0, 500, 96, 48);
 
   // Vekta annonserer sjelden og avviser mange tilkoblinger, så vi prøver kontinuerlig en stund.
   bool ok = false;
@@ -368,7 +367,7 @@ static void runSession() {
   }
   if (VERBOSE) Serial.println("Abonnerer. Stå på vekta ...");
   blink(1, 100);
-  writeDateTime(client);
+  if (timeValid()) writeDateTime(client);
   writeUserCmd(client);
 
   uint32_t start = millis();
@@ -408,6 +407,7 @@ void setup() {
   delay(2000);
   if (VERBOSE) Serial.println("Scale2MQTT starter");
   loadPending();
+  if (timeValid()) nextTimeSync = millis() + 86400000UL;
   NimBLEDevice::init("");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEScan *scan = NimBLEDevice::getScan();
@@ -419,7 +419,7 @@ void setup() {
 }
 
 void loop() {
-  if ((pendingCount > 0 || timeSyncDue()) && (int32_t)(millis() - nextPublishTry) >= 0) {
+  if ((pendingCount > 0 || (timeValid() && timeSyncDue())) && (int32_t)(millis() - nextPublishTry) >= 0) {
     if (!publishPending() && pendingCount > 0) blink(3, 600);
     return;
   }
